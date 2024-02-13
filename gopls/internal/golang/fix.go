@@ -5,13 +5,17 @@
 package golang
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
+	"slices"
 
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/gopls/internal/analysis/embeddirective"
 	"golang.org/x/tools/gopls/internal/analysis/fillstruct"
 	"golang.org/x/tools/gopls/internal/analysis/stubmethods"
@@ -61,6 +65,7 @@ func singleFile(fixer1 singleFileFixer) fixer {
 const (
 	fixExtractVariable   = "extract_variable"
 	fixExtractFunction   = "extract_function"
+	fixExtractInterface  = "extract_interface"
 	fixExtractMethod     = "extract_method"
 	fixInlineCall        = "inline_call"
 	fixInvertIfCondition = "invert_if_condition"
@@ -110,6 +115,7 @@ func ApplyFix(ctx context.Context, fix string, snapshot *cache.Snapshot, fh file
 
 		// Ad-hoc fixers: these are used when the command is
 		// constructed directly by logic in server/code_action.
+		fixExtractInterface:  extractInterface,
 		fixExtractFunction:   singleFile(extractFunction),
 		fixExtractMethod:     singleFile(extractMethod),
 		fixExtractVariable:   singleFile(extractVariable),
@@ -136,6 +142,149 @@ func ApplyFix(ctx context.Context, fix string, snapshot *cache.Snapshot, fh file
 		return nil, nil
 	}
 	return suggestedFixToEdits(ctx, snapshot, fixFset, suggestion)
+}
+
+func extractInterface(ctx context.Context, snapshot *cache.Snapshot, pkg *cache.Package, pgf *parsego.File, start, end token.Pos) (*token.FileSet, *analysis.SuggestedFix, error) {
+	path, _ := astutil.PathEnclosingInterval(pgf.File, start, end)
+
+	var field *ast.Field
+	var genDecl *ast.GenDecl
+	var fieldType ast.Node
+	for _, node := range path {
+		if f, ok := node.(*ast.Field); ok {
+			field = f
+			continue
+		}
+
+		// If field has been set, it means that the previous node was the node that
+		// started the field type, so we don't want to overwrite it anymore.
+		if field == nil {
+			fieldType = node
+		}
+
+		// Record the node that starts the declaration of the type that contains
+		// the field we are creating the interface from.
+		if f, ok := node.(*ast.GenDecl); ok {
+			genDecl = f
+			break // the field should have been found at this point
+		}
+	}
+
+	if field == nil {
+		return nil, nil, nil
+	}
+
+
+	p := pkg.FileSet().Position(field.Pos())
+	pos := protocol.Position{
+		Line:      uint32(p.Line - 1),   // Line is zero-based
+		Character: uint32(p.Column - 1), // Character is zero-based
+	}
+
+	fh, err := snapshot.ReadFile(ctx, pgf.URI)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	refs, err := references(ctx, snapshot, fh, pos, false)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	type methodCall struct {
+		signature *types.Signature
+		funcName  string
+	}
+
+	var methodCalls []methodCall
+	for _, ref := range refs {
+		loc := ref.location
+		afh, err := snapshot.ReadFile(ctx, loc.URI)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		pgf, err := snapshot.ParseGo(ctx, afh, ParseFull)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		_, end, err := pgf.RangePos(loc.Range)
+		if err != nil {
+			return nil, nil, err
+		}
+
+    // We are interested in the method call, so we need the node after the dot
+    rangeEnd := end+token.Pos(len("."))
+		path, _ := astutil.PathEnclosingInterval(pgf.File, rangeEnd, rangeEnd)
+		id, ok := path[0].(*ast.Ident)
+		if !ok {
+			continue
+		}
+
+		for k := range snapshot.MetadataGraph().Packages {
+			ps, err := snapshot.TypeCheck(ctx, k)
+			if err != nil {
+				continue
+			}
+
+			obj := ps[0].GetTypesInfo().ObjectOf(id)
+			if obj == nil {
+				continue
+			}
+
+			sig, ok := obj.Type().(*types.Signature)
+			if !ok {
+				return nil, nil, errors.New("cannot extract interface with non-method accesses")
+			}
+
+			fc := methodCall{signature: sig, funcName: obj.Name()}
+			if !slices.Contains(methodCalls, fc) {
+				methodCalls = append(methodCalls, fc)
+			}
+		}
+	}
+
+	interfaceName := "I" + pkg.GetTypesInfo().ObjectOf(field.Names[0]).Name()
+	var buf bytes.Buffer
+	buf.WriteString("\ntype ")
+	buf.WriteString(interfaceName)
+	buf.WriteString(" interface {\n")
+	for _, fc := range methodCalls {
+		buf.WriteString("\t")
+    buf.WriteString(fc.funcName)
+    types.WriteSignature(&buf, fc.signature, relativeTo(pkg.GetTypes()))
+		buf.WriteByte('\n')
+	}
+	buf.WriteByte('}')
+	buf.WriteByte('\n')
+
+	fix := analysis.SuggestedFix{
+		Message: "Extract interface",
+		TextEdits: []analysis.TextEdit{{
+			Pos:     genDecl.Pos() - 1,
+			End:     genDecl.Pos() - 1,
+			NewText: buf.Bytes(),
+		}, {
+			Pos:     fieldType.Pos(),
+			End:     fieldType.End(),
+			NewText: []byte(interfaceName),
+		}},
+	}
+
+	return pkg.FileSet(), &fix, nil
+}
+
+func relativeTo(pkg *types.Package) types.Qualifier {
+	if pkg == nil {
+		return nil
+	}
+	return func(other *types.Package) string {
+		if pkg == other {
+			return "" // same package; unqualified
+		}
+		return other.Name()
+	}
 }
 
 // suggestedFixToEdits converts the suggestion's edits from analysis form into protocol form.

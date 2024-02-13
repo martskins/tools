@@ -127,6 +127,32 @@ func CanExtractVariable(start, end token.Pos, file *ast.File) (ast.Expr, []ast.N
 	return nil, nil, false, fmt.Errorf("cannot extract an %T to a variable", expr)
 }
 
+// CanExtractInterface reports whether the code in the given position is for a
+// type which can be represented as an interface.
+func CanExtractInterface(start, end token.Pos, file *ast.File) (ast.Expr, []ast.Node, bool, error) {
+	path, _ := astutil.PathEnclosingInterval(file, start, end)
+	if len(path) == 0 {
+		return nil, nil, false, fmt.Errorf("no path enclosing interval")
+	}
+	for _, n := range path {
+		if _, ok := n.(*ast.ImportSpec); ok {
+			return nil, nil, false, fmt.Errorf("cannot extract interface in an import block")
+		}
+	}
+
+	node := path[0]
+	expr, ok := node.(ast.Expr)
+	if !ok {
+		return nil, nil, false, fmt.Errorf("node is not an expression")
+	}
+
+	switch expr.(type) {
+	case *ast.Ident, *ast.StarExpr, *ast.SelectorExpr:
+		return expr, path, true, nil
+	}
+	return nil, nil, false, fmt.Errorf("cannot extract interface from a %T", expr)
+}
+
 // Calculate indentation for insertion.
 // When inserting lines of code, we must ensure that the lines have consistent
 // formatting (i.e. the proper indentation). To do so, we observe the indentation on the
